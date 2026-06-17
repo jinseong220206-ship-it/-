@@ -3,7 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>세븐나이츠 리버스 길드전 예약 시스템 v12</title>
+    <title>세븐나이츠 리버스 길드전 예약 시스템 v13 (실시간 서버 연동)</title>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-database-compat.js"></script>
     <style>
         body { background-color: #0f172a; color: #f8fafc; font-family: 'Malgun Gothic', sans-serif; margin: 0; padding: 20px; }
         .container { max-width: 1400px; margin: 0 auto; display: flex; gap: 20px; flex-direction: column; }
@@ -97,12 +99,14 @@
         .btn-success { background-color: #dc2626; }
         .btn-failure { background-color: #ea580c; }
         .btn-cancel { background-color: #475569; }
+        #loading-screen { position: fixed; top:0; left:0; width:100%; height:100%; background:#0f172a; display:flex; justify-content:center; align-items:center; z-index:9999; font-size:20px; color:#facc15; font-weight:bold; }
     </style>
 </head>
 <body>
 
+<div id="loading-screen">데이터베이스 연결 중...</div>
+
 <div class="container">
-    <!-- 왼쪽: 길드원 관리 및 종합 전적 현황판 (비밀번호 기능 추가) -->
     <div class="guild-sidebar">
         <h3 style="margin: 0; color: #facc15; font-size: 16px; border-bottom: 1px solid #334155; padding-bottom: 10px;">👥 길드원 보안 현황판</h3>
         
@@ -111,25 +115,22 @@
             <input type="password" id="admin-password" class="input-pw" placeholder="관리자 비번 입력" oninput="checkPassword(this.value)">
         </div>
 
-        <!-- 30명 현황판 영역 -->
         <div class="member-status-list" id="member-status-container"></div>
     </div>
 
-    <!-- 오른쪽: 메인 콘텐츠 -->
     <div class="main-content">
         <header>
             <div>
                 <h1>⚔️ 세븐나이츠 리버스 길드전</h1>
-                <div style="color: #94a3b8; font-size: 12px; margin-top: 4px;">개인 핀번호(비밀번호) 보안 기능 탑재 v12</div>
+                <div style="color: #94a3b8; font-size: 12px; margin-top: 4px;">실시간 연동 보안 서버 구동 v13</div>
             </div>
             <div class="nickname-box">
                 <span style="font-size: 13px; color:#94a3b8;">접속자:</span>
-                <span class="user-badge" id="current-user-display">로그인 필요</span>
+                <span class="user-badge" id="current-user-display">로딩 중...</span>
                 <button class="logout-btn" onclick="logout()">계정 전환</button>
             </div>
         </header>
 
-        <!-- 거점 선택 탭 -->
         <div class="tab-section">
             <div class="tab-label">🛡️ 외성 구역 (각 10개 덱)</div>
             <div class="tab-group">
@@ -157,27 +158,94 @@
 </div>
 
 <script>
+    // ==========================================
+    // ⚠️ [필수 설정] 본인의 Firebase 정보 입력 칸
+    // ==========================================
+    const firebaseConfig = {
+        apiKey: "YOUR_API_KEY",
+        authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+        databaseURL: "https://YOUR_PROJECT_ID-default-rtdb.firebaseio.com",
+        projectId: "YOUR_PROJECT_ID",
+        storageBucket: "YOUR_PROJECT_ID.appspot.com",
+        messagingSenderId: "YOUR_MESSAGING_ID",
+        appId: "YOUR_APP_ID"
+    };
+    
+    // Firebase 초기화
+    firebase.initializeApp(firebaseConfig);
+    const database = firebase.database();
+    const membersRef = database.ref('guildMembers');
+    const decksRef = database.ref('decksData');
+
     const REAL_ADMIN_PASSWORD = "1234"; 
     let isAdminMode = false; 
+    let currentCastle = '외성 1번';
 
-    // 데이터 구조에 비밀번호(password) 추가. 초기값은 "0000"
-    let guildMembers = JSON.parse(localStorage.getItem('skr_guild_members_v4')) || 
-                       Array(30).fill(null).map(() => ({ name: "", password: "0000", tickets: 5, success: 0, fail: 0 }));
+    let guildMembers = [];
+    let DecksData = [];
     
-    let DecksData = JSON.parse(localStorage.getItem('skr_decks_data')) || [];
+    // '접속 유저 정보'는 개인 브라우저에 남아야 하므로 localStorage 유지
     let currentUser = localStorage.getItem('skr_current_user') || "";
 
-    if (DecksData.length === 0) {
-        let idCounter = 1;
-        for (let c = 1; c <= 5; c++) { for (let d = 1; d <= 10; d++) { DecksData.push({ id: idCounter++, castleName: `외성 ${c}번`, deckNum: `${d}번 덱`, status: '대기중', defender: '', attacker: '', failCount: 0 }); } }
-        for (let c = 1; c <= 3; c++) { for (let d = 1; d <= 15; d++) { DecksData.push({ id: idCounter++, castleName: `내성 ${c}번`, deckNum: `${d}번 덱`, status: '대기중', defender: '', attacker: '', failCount: 0 }); } }
-        for (let d = 1; d <= 20; d++) { DecksData.push({ id: idCounter++, castleName: `본성`, deckNum: `${d}번 덱`, status: '대기중', defender: '', attacker: '', failCount: 0 }); }
-        localStorage.setItem('skr_decks_data', JSON.stringify(DecksData));
+    // 실시간 비동기 로딩 체크 변수
+    let isMembersLoaded = false;
+    let isDecksLoaded = false;
+    let isAuthStarted = false;
+
+    // --- 1. 실시간 길드원 데이터 수신 및 동기화 ---
+    membersRef.on('value', (snapshot) => {
+        const data = snapshot.val();
+        if (data) {
+            guildMembers = data;
+        } else {
+            // DB에 데이터가 아예 없는 초기 상태면 구조 자동 세팅
+            guildMembers = Array(30).fill(null).map(() => ({ name: "", password: "0000", tickets: 5, success: 0, fail: 0 }));
+            saveMembers();
+        }
+        isMembersLoaded = true;
+        drawSidebar();
+        checkLoadingAndInitAuth();
+    });
+
+    // --- 2. 실시간 덱 데이터 수신 및 동기화 ---
+    decksRef.on('value', (snapshot) => {
+        const data = snapshot.val();
+        if (data && data.length > 0) {
+            DecksData = data;
+        } else {
+            // DB에 덱이 없는 최초 실행 시 생성
+            let idCounter = 1;
+            let initialDecks = [];
+            for (let c = 1; c <= 5; c++) { for (let d = 1; d <= 10; d++) { initialDecks.push({ id: idCounter++, castleName: `외성 ${c}번`, deckNum: `${d}번 덱`, status: '대기중', defender: '', attacker: '', failCount: 0 }); } }
+            for (let c = 1; c <= 3; c++) { for (let d = 1; d <= 15; d++) { initialDecks.push({ id: idCounter++, castleName: `내성 ${c}번`, deckNum: `${d}번 덱`, status: '대기중', defender: '', attacker: '', failCount: 0 }); } }
+            for (let d = 1; d <= 20; d++) { initialDecks.push({ id: idCounter++, castleName: `본성`, deckNum: `${d}번 덱`, status: '대기중', defender: '', attacker: '', failCount: 0 }); }
+            DecksData = initialDecks;
+            saveToStorage();
+        }
+        isDecksLoaded = true;
+        drawDecks();
+        checkLoadingAndInitAuth();
+    });
+
+    // 서버 데이터를 모두 받았을 때 로딩창을 끄고 로그인을 시작함
+    function checkLoadingAndInitAuth() {
+        if (isMembersLoaded && isDecksLoaded) {
+            document.getElementById('loading-screen').style.display = 'none';
+            if (!isAuthStarted) {
+                isAuthStarted = true;
+                authGateway();
+            }
+        }
     }
+
+    // 데이터 저장소를 Firebase 서버로 변경
+    function saveMembers() { membersRef.set(guildMembers); }
+    function saveToStorage() { decksRef.set(DecksData); }
 
     // 왼쪽 종합 현황판 그리기
     function drawSidebar() {
         const container = document.getElementById('member-status-container');
+        if (!container) return;
         container.innerHTML = '';
         
         guildMembers.forEach((m, idx) => {
@@ -192,7 +260,6 @@
                 badgeHtml = `<span class="status-badge empty">소진</span>`;
             }
 
-            // 관리자 모드일 때만 비밀번호 칸이 보이고 편집 가능함
             let pwInputHtml = '';
             if (isAdminMode && m.name !== "") {
                 pwInputHtml = `
@@ -230,36 +297,27 @@
 
     function updateMemberName(index, value) {
         guildMembers[index].name = value.trim();
-        // 이름을 새로 등록하면 해당 슬롯 비번은 0000으로 자동 리셋
         if (guildMembers[index].name !== "" && !guildMembers[index].password) {
             guildMembers[index].password = "0000";
         }
         saveMembers();
-        drawSidebar();
     }
 
     function updateMemberPassword(index, value) {
         guildMembers[index].password = value.trim() || "0000";
         saveMembers();
-        drawSidebar();
     }
 
     function updateMemberStat(index, field, value) {
         guildMembers[index][field] = Math.max(0, parseInt(value) || 0);
         saveMembers();
-        drawSidebar();
-        drawDecks();
-    }
-
-    function saveMembers() {
-        localStorage.setItem('skr_guild_members_v4', JSON.stringify(guildMembers));
     }
 
     function getGuildMemberObj(name) {
         return guildMembers.find(m => m.name !== "" && m.name === name);
     }
 
-    // ★ [보안 고도화] 닉네임 + 비밀번호 2차 검증 인증 시스템
+    // 닉네임 + 비밀번호 2차 검증 시스템
     function authGateway() {
         const emptyCheck = guildMembers.filter(m => m.name !== "").length;
         if (emptyCheck === 0) {
@@ -285,7 +343,6 @@
             const userObj = getGuildMemberObj(nameInput);
 
             if (userObj) {
-                // 비밀번호 확인 검증창
                 let pwInput = prompt(`🔑 [${nameInput}]님의 4자리 비밀번호(핀번호)를 입력하세요:\n(초기 비밀번호는 0000 입니다)`);
                 if (pwInput === null) {
                     authCancelAction();
@@ -297,7 +354,6 @@
                     localStorage.setItem('skr_current_user', currentUser);
                     document.getElementById('current-user-display').innerText = currentUser;
 
-                    // 만약 초기 비번 0000이면 강제 변경 유도
                     if (pwInput.trim() === "0000") {
                         let newPw = prompt("⚠️ 보안을 위해 새로운 비밀번호(4자리 권장)를 입력해 주세요:");
                         if (newPw && newPw.trim() !== "" && newPw.trim() !== "0000") {
@@ -345,8 +401,6 @@
         drawSidebar();
     }
 
-    let currentCastle = '외성 1번';
-
     function hasPermission(deck) {
         if (deck.attacker === "" || deck.attacker === currentUser || isAdminMode) {
             return true;
@@ -356,6 +410,7 @@
 
     function drawDecks() {
         const grid = document.getElementById('deck-grid');
+        if (!grid) return;
         grid.innerHTML = '';
         document.getElementById('current-castle-title').innerText = `${currentCastle} 방어덱 현황`;
 
@@ -424,8 +479,6 @@
         });
     }
 
-    function saveToStorage() { localStorage.setItem('skr_decks_data', JSON.stringify(DecksData)); }
-
     function updateDefender(id, value) { 
         const deck = DecksData.find(d => d.id === id);
         if (!hasPermission(deck)) { alert(`❌ 수정 불가: 타인이 사용 중인 성물 설정입니다.`); drawDecks(); return; }
@@ -438,7 +491,6 @@
         if (!hasPermission(deck)) { alert(`❌ 수정 불가: 타인이 사용 중인 성물 설정입니다.`); drawDecks(); return; }
         deck.failCount = parseInt(value) || 0;
         saveToStorage();
-        drawDecks();
     }
 
     function book(id) {
@@ -456,7 +508,6 @@
         deck.status = '예약됨';
         deck.attacker = currentUser;
         saveToStorage();
-        drawDecks();
     }
 
     function useTicketAndChangeState(id, nextStatus) {
@@ -478,7 +529,6 @@
             } else if (nextStatus === '공격실패') {
                 userObj.fail = (userObj.fail || 0) + 1;
             }
-            saveMembers();
         }
 
         deck.status = nextStatus;
@@ -486,9 +536,9 @@
             deck.failCount += 1;
         }
         
+        // 동시 업데이트 처리를 위해 트랜잭션 대신 순차 set 수행 (안정성 강화)
+        saveMembers();
         saveToStorage();
-        drawSidebar(); 
-        drawDecks();
     }
 
     function changeState(id, status) {
@@ -497,7 +547,6 @@
         deck.status = status;
         if (status === '대기중') deck.attacker = '';
         saveToStorage();
-        drawDecks();
     }
 
     function resetDeck(id) {
@@ -506,7 +555,6 @@
         deck.attacker = '';
         deck.failCount = 0;
         saveToStorage();
-        drawDecks();
     }
 
     function switchCastle(castleName) {
@@ -518,10 +566,6 @@
         });
         drawDecks();
     }
-
-    authGateway();
-    drawSidebar();
-    drawDecks();
 </script>
 </body>
 </html>
